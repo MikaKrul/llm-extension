@@ -3,266 +3,54 @@
 // See the LICENSE file in the project root for more information.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
 using Windows.Foundation;
 using System.ClientModel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using OllamaSharp;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
-using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
-using Microsoft.SemanticKernel.Connectors.Google;
-using Microsoft.SemanticKernel.Connectors.MistralAI;
-using Microsoft.SemanticKernel.Connectors.Ollama;
 using Microsoft.SemanticKernel;
-using System.Collections;
 
 namespace LlmExtension;
 
 internal sealed partial class LlmExtensionPage : DynamicListPage
 {
-    /// <summary>
-    ///     Supported services.
-    /// </summary>
-    enum Service
-    {
-        Ollama,
-        OpenAI,
-        AzureOpenAI,
-        Google,
-        Mistral,
-    }
-
-    /// <summary>
-    ///     User and assistant chat conversation message.
-    /// </summary>
-    class ChatMessage
-    {
-        public required string User { get; set; }
-        public required string Assistant { get; set; }
-    }
-
-    /// <summary>
-    ///     User configurations.
-    /// </summary>
-    class Config
-    {
-        public Service Service { get; set; } = Service.Ollama;
-        public string Url { get; set; } = "";
-        public string? Model { get; set; }
-        public bool Details { get; set; } = true;
-        public string? ApiKey { get; set; }
-        public string System { get; set; } =
-            "You are an AI assistant, you should provide help to the user with their query. " +
-            "Act as if you are human with emotions, use fun and relaxing tone when appropriate. " +
-            "However, remember you are still an AI model. Respond in Markdown format if necessary.";
-
-        public int History { get; set; } = 6;
-        public bool Debug { get; set; }
-        public int MaxTokens { get; set; } = 4096;
-        public float Temperature { get; set; } = 0.8f;
-        public float TopP { get; set; } = 1.0f;
-    }
-
-    /// <summary>
-    ///     Client containing the configuration and the service.
-    /// </summary>
-    class Client
-    {
-        public required Config Config;
-        private IChatCompletionService? Service { get; set; }
-        public IEnumerable<string> MissingConfigs { get; private set; } = new List<string>();
-
-        public void ReinitializeService()
-        {
-            MissingConfigs = MissingConfigsForService();
-
-            if (MissingConfigs.Any())
-            {
-                return;
-            }
-
-            Service = CreateService(Config);
-        }
-
-        async public IAsyncEnumerable<string> Chat(IEnumerable<ChatMessage> messages)
-        {
-            if (Service == null) yield break;
-
-            // Build history
-            ChatHistory history = [];
-            history.AddSystemMessage(Config.System);
-            var relevantMessages = messages.Take(Config.History).Reverse();
-            foreach (var message in relevantMessages)
-            {
-                if (!string.IsNullOrEmpty(message.User))
-                {
-                    history.AddUserMessage(message.User);
-                }
-
-                if (!string.IsNullOrEmpty(message.Assistant))
-                {
-                    history.AddAssistantMessage(message.Assistant);
-                }
-            }
-
-            // Build execution settings
-#pragma warning disable SKEXP0070
-            PromptExecutionSettings settings = Config.Service switch
-            {
-                LlmExtensionPage.Service.Ollama => new OllamaPromptExecutionSettings()
-                {
-                    Temperature = Config.Temperature,
-                    TopP = Config.TopP,
-                },
-                LlmExtensionPage.Service.OpenAI => new OpenAIPromptExecutionSettings()
-                {
-                    MaxTokens = Config.MaxTokens,
-                    Temperature = Config.Temperature,
-                    TopP = Config.TopP == 1.0f ? null : Config.TopP,
-                },
-                LlmExtensionPage.Service.AzureOpenAI => new AzureOpenAIPromptExecutionSettings()
-                {
-                    MaxTokens = Config.MaxTokens,
-                    Temperature = Config.Temperature,
-                    TopP = Config.TopP == 1.0f ? null : Config.TopP,
-                },
-                LlmExtensionPage.Service.Google => new GeminiPromptExecutionSettings()
-                {
-                    MaxTokens = Config.MaxTokens,
-                    Temperature = Config.Temperature,
-                    TopP = Config.TopP,
-                },
-                LlmExtensionPage.Service.Mistral => new MistralAIPromptExecutionSettings()
-                {
-                    MaxTokens = Config.MaxTokens,
-                    Temperature = Config.Temperature,
-                    TopP = Config.TopP,
-                },
-            };
-
-            await foreach (var content in Service.GetStreamingChatMessageContentsAsync(history, settings))
-            {
-                if (string.IsNullOrEmpty(content.Content))
-                {
-                    continue;
-                }
-
-                yield return content.Content;
-            }
-        }
-
-        public IEnumerable<string> MissingConfigsForService()
-        {
-            var missingFields = new List<string>();
-
-            if (string.IsNullOrEmpty(Config.Model)) missingFields.Add("model");
-
-            if (Config.Service == LlmExtensionPage.Service.Ollama)
-            {
-                if (string.IsNullOrEmpty(Config.Url)) missingFields.Add("url");
-            }
-            else if (Config.Service == LlmExtensionPage.Service.AzureOpenAI)
-            {
-                if (string.IsNullOrEmpty(Config.ApiKey)) missingFields.Add("apikey");
-            }
-            else if (Config.Service == LlmExtensionPage.Service.Google)
-            {
-                if (string.IsNullOrEmpty(Config.ApiKey)) missingFields.Add("apikey");
-            }
-            else if (Config.Service == LlmExtensionPage.Service.Mistral)
-            {
-                if (string.IsNullOrEmpty(Config.ApiKey)) missingFields.Add("apikey");
-            }    
-
-            return missingFields;
-        }
-
-        public static IChatCompletionService CreateService(Config config)
-        {
-            return config.Service switch
-            {
-                LlmExtensionPage.Service.Ollama => CreateOllamaService(config),
-                LlmExtensionPage.Service.OpenAI => CreateOpenAIService(config),
-                LlmExtensionPage.Service.AzureOpenAI => CreateAzureOpenAIService(config),
-                LlmExtensionPage.Service.Google => CreateGoogleService(config),
-                LlmExtensionPage.Service.Mistral => CreateMistralService(config),
-                _ => throw new ArgumentException("Invalid service name")
-            };
-        }
-
-#pragma warning disable SKEXP0001
-        private static IChatCompletionService CreateOllamaService(Config config) => new OllamaApiClient(
-                uriString: config.Url,
-                defaultModel: config.Model ?? ""
-        ).AsChatCompletionService();
-
-        private static OpenAIChatCompletionService CreateOpenAIService(Config config) => new(
-            config.Model ?? " ",
-            new OpenAI.OpenAIClient(
-                new ApiKeyCredential(config.ApiKey ?? " "),
-                new OpenAI.OpenAIClientOptions() { Endpoint = string.IsNullOrEmpty(config.Url) ? null : new Uri(config.Url) }));
-
-        private static AzureOpenAIChatCompletionService CreateAzureOpenAIService(Config config) => new(
-            config.Model ?? " ",
-            new Azure.AI.OpenAI.AzureOpenAIClient(new Uri(config.Url), new ApiKeyCredential(config.ApiKey ?? " ")));
-
-#pragma warning disable SKEXP0070
-        private static GoogleAIGeminiChatCompletionService CreateGoogleService(Config config) => new(
-            config.Model ?? " ",
-            config.ApiKey ?? " ");
-
-        private static MistralAIChatCompletionService CreateMistralService(Config config) => new(
-            config.Model ?? " ",
-            config.ApiKey ?? " ",
-            string.IsNullOrEmpty(config.Url) ? null : new Uri(config.Url));
-    }
-
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-    private static readonly string ConfigPath = "%USERPROFILE%\\.config\\LlmExtensionForCmdPal\\config.json";
     private static readonly string HelpMessage =
         "## What is this extension\n" +
         "\n" +
-        "This extension allows you to chat with LLM models, including Ollama, OpenAI, Azure OpenAI, Google Gemini, or Mistral, either hosted by yourself or by a third party.\n" +
-        "\n" +
-        "## How to use this extension\n" +
-        "\n" +
-        "There are two ways to interact with this extension:\n" +
-        "\n" +
-        "1. **Chat**: Type your message in the search box and press enter to send it to the LLM model. The model will respond with a message.\n" +
-        "\n" +
-        "2. **Commands**: Type `/` in the search box to see a list of available commands. You can use these commands to configure the extension, such as setting the model, API key, and other options.\n" +
+        "This extension lets you chat with LLM models — Ollama, OpenAI, Azure OpenAI, Google Gemini, Groq or Mistral — hosted on your own machine or by a third party.\n" +
         "\n" +
         "## Setting up the extension\n" +
         "\n" +
-        "1. **Setup your LLM model**: You need to have a LLM model running on your local machine or a server. Visit the supported service providers respective websites for more information on how to set them up.\n" +
+        "The easiest way is the setup wizard: run `/setup`, pick your service, and paste in the answers to the questions (server URL, model, API key). You can also start the wizard from the \"Set up LLM chat\" item on the main page.\n" +
         "\n" +
-        "2. **Configure the extension**: Use commands to setup the connection with the LLM model.\n" +
+        "- For **Ollama**, start the server yourself (`ollama serve`) and pull a model (`ollama pull llama3.1`). No API key needed.\n" +
+        "- For **OpenAI**, **AzureOpenAI**, **Google**, **Groq** or **Mistral**, create an account and an API key on the provider's website, then paste the model name and key into the wizard.\n" +
+        "- Any OpenAI-compatible API (such as Docker Model Runner) works through the **OpenAI** service by filling in its URL.\n" +
         "\n" +
-        "    - `/service <service>`: Set the API service to call (Ollama, OpenAI, AzureOpenAI, Google, or Mistral).\n" +
-        "        - For other services with OpenAPI compatible APIs such as Docker Model Runner, use the `OpenAI` service.\n" +
-        "    - `/url <url>`: Set the server URL.\n" +
-        "        - For services that do not need a URL, you may enter `/url ` without any arguments.\n" +
-        "        - For Ollama, usually `http://localhost:11434/`.\n" +
-        "        - For AzureOpenAI, usually `https://your-id.openai.azure.com/`.\n" +
-        "        - For Docker Model Runner, usually `https://localhost:your-port/engines/llama.cpp/v1/` with OpenAI service.\n" +
-        "    - `/model <model-name>`: Set the model to use.\n" +
-        "        - For AzureOpenAI, this is the deployment name.\n" +
-        "    - `/apikey <api-key>`: Set the API key.\n" +
-        "        - For Ollama, this is not applicable.\n" +
+        "## Web search\n" +
         "\n" +
-        "3. **Send a message**: Type your message in the search box and press enter to send it to the LLM model. The model will respond with a message.\n" +
+        "Enable web search in the last setup step (or with `/websearch`) and paste an Exa API key to let the LLM use fresh information from the web. When enabled, your message is first sent to Exa, and the results are given to the model together with your question.\n" +
         "\n" +
-        "## YouTube Playlist\n" +
+        "## How to chat\n" +
         "\n" +
-        "There is also a YouTube playlist introducing the usage of the extension! Run the command `/videos` to open the link.";
+        "Type your message in the search box and press Enter to send it. Press Enter on \"Compose multiline message\" to type or paste longer text. Advanced commands are still available by typing `/`:\n" +
+        "\n" +
+        "- `/setup`: Run the guided setup wizard.\n" +
+        "- `/service`, `/url`, `/model`, `/apikey`: Change the connection (advanced alternative to the wizard).\n" +
+        "- `/websearch`, `/exakey`: Toggle web search and set the Exa API key.\n" +
+        "- `/system`, `/history`, `/maxtokens`, `/temperature`, `/topp`, `/detail`, `/debug`: Fine-tune the model behavior.\n" +
+        "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open the config folder, show this message.\n";
+
+    /// <summary>
+    ///     Raised by the setup wizard when the configuration changed, so the main
+    ///     page can persist and refresh its state.
+    /// </summary>
+    internal static event Action? ConfigurationApplied;
 
     private readonly Client _client;
     private readonly IList<ChatMessage> _messages;
@@ -281,15 +69,19 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
 
         _client = new Client()
         {
-            Config = ReadConfig()
+            Config = ConfigStore.Read()
         };
         _client.ReinitializeService();
         _messages = [new() { User = "", Assistant = "" }];
         _commands = new Dictionary<string, SlashCommand>()
         {
+            { "setup", new(
+                () => $"Run the guided setup wizard (current service: {_client.Config.Service})",
+                Page: () => new SetupPage(_client)
+            ) },
             { "service", new(
                 () => $"Set the API service to call (currently: {_client.Config.Service})",
-                "<one-of-[ Ollama | OpenAI | AzureOpenAI | Google | Mistral ]>",
+                "<one-of-[ Ollama | OpenAI | AzureOpenAI | Google | Groq | Mistral ]>",
                 (sender, args, opts) => {
                     Service? service = opts.ToLowerInvariant() switch
                     {
@@ -297,13 +89,14 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                         "openai" => Service.OpenAI,
                         "azureopenai" => Service.AzureOpenAI,
                         "google" => Service.Google,
+                        "groq" => Service.Groq,
                         "mistral" => Service.Mistral,
                         _ => null,
                     };
 
                     if (service == null)
                     {
-                        ErrorToast($"Invalid service '{opts}', expected one of 'Ollama', 'OpenAI', 'AzureOpenAI', 'Google', 'Mistral'");
+                        ErrorToast($"Invalid service '{opts}', expected one of 'Ollama', 'OpenAI', 'AzureOpenAI', 'Google', 'Groq', 'Mistral'");
                         return;
                     }
                     else
@@ -353,6 +146,25 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                     RefreshConfigs();
                 },
                 "API key configured")
+            },
+            { "websearch", new(
+                () => $"Toggle Exa web search for your messages (current: {(_client.Config.WebSearch ? "on" : "off")})",
+                Action: (sender, args, opts) =>
+                {
+                    _client.Config.WebSearch = !_client.Config.WebSearch;
+                    RefreshConfigs();
+                },
+                ActionToastText: "Web search toggled")
+            },
+            { "exakey", new(
+                () => $"Set the Exa API key for web search",
+                "<exa-api-key>",
+                (sender, args, opts) =>
+                {
+                    _client.Config.ExaApiKey = opts;
+                    RefreshConfigs();
+                },
+                "Exa API key configured")
             },
             { "detail", new(
                 () => $"Toggle full detailed response on the side (current: {_client.Config.Details})",
@@ -486,10 +298,6 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 () => $"Help message on usage of this extension",
                 Details: () => ("Help message", HelpMessage)
             ) },
-            { "videos", new(
-                () => $"Open the YouTube playlist of introducing the usage of this extension",
-                Url: "https://www.youtube.com/playlist?list=PLtpfYcxJV4LHu0gpKagHWjYR1Lghulnt8"
-            ) },
             { "config", new(
                 () => $"Open the folder containing the configuration file",
                 Url: Environment.ExpandEnvironmentVariables("%USERPROFILE%\\.config\\LlmExtensionForCmdPal")
@@ -513,6 +321,8 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 ActionToastText: "All settings reset")
             },
         };
+
+        ConfigurationApplied += RefreshConfigs;
 
         UpdateCommandsMemo();
         UpdateMessagesMemo();
@@ -562,10 +372,10 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
 
             if (_client.MissingConfigs.Any())
             {
-                return [new ListItem(new NoOpCommand()) {
+                return [new ListItem(new GoToPageCommand(() => new SetupPage(_client))) {
                     Icon = new IconInfo("\u26A0"),
                     Title = $"Configuration incomplete for {_client.Config.Service}",
-                    Subtitle = $"The missing configurations are: {string.Join(", ", _client.MissingConfigs)}" }];
+                    Subtitle = $"Missing: {string.Join(", ", _client.MissingConfigs)} — press Enter to answer the setup questions" }];
             }
 
             return _messagesMemo;
@@ -579,53 +389,10 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         }
     }
 
-    private void SaveConfig()
-    {
-        var path = Environment.ExpandEnvironmentVariables(ConfigPath);
-        var dir = Path.GetDirectoryName(path)!;
-
-        if (!Directory.Exists(dir))
-            Directory.CreateDirectory(dir);
-
-        var json = JsonSerializer.Serialize(_client.Config, JsonOptions);
-        File.WriteAllText(path, json);
-    }
-
-    private static Config ReadConfig()
-    {
-        var path = Environment.ExpandEnvironmentVariables(ConfigPath);
-        var dir = Path.GetDirectoryName(path)!;
-
-        if (!Directory.Exists(dir))
-            Directory.CreateDirectory(dir);
-
-        if (!File.Exists(path))
-        {
-            var defaultConfig = new Config();
-            var json = JsonSerializer.Serialize(defaultConfig, JsonOptions);
-            File.WriteAllText(path, json);
-            return defaultConfig;
-        }
-
-        try
-        {
-            var fileContent = File.ReadAllText(path);
-            var config = JsonSerializer.Deserialize<Config>(fileContent) ?? new Config();
-            return config;
-        }
-        catch (JsonException)
-        {
-            var defaultConfig = new Config();
-            var json = JsonSerializer.Serialize(defaultConfig, JsonOptions);
-            File.WriteAllText(path, json);
-            return defaultConfig;
-        }
-    }
-
     private void RefreshConfigs()
     {
         _client.ReinitializeService();
-        SaveConfig();
+        ConfigStore.Save(_client.Config);
         SearchText = "";
         UpdateCommandsMemo();
         UpdateMessagesMemo();
@@ -638,11 +405,13 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         {
             ICommand command = c.Value.Action != null
                 ? SendMessageCommand.CreateCommand(c.Key, c.Value, () => SearchText, _client.Config.Debug)
-                : c.Value.Details != null
-                    ? new MarkdownPage(c.Value.Details.Invoke().Item1, c.Value.Details.Invoke().Item2)
-                    : c.Value.Url != null
-                        ? new OpenUrlCommand(c.Value.Url)
-                        : new NoOpCommand();
+                : c.Value.Page != null
+                    ? new GoToPageCommand(c.Value.Page)
+                    : c.Value.Details != null
+                        ? new MarkdownPage(c.Value.Details.Invoke().Item1, c.Value.Details.Invoke().Item2)
+                        : c.Value.Url != null
+                            ? new OpenUrlCommand(c.Value.Url)
+                            : new NoOpCommand();
 
             if (c.Value.Action != null)
             {
@@ -700,7 +469,28 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
             UpdateMessagesMemo();
             RaiseItemsChanged();
 
-            await foreach (var response in _client.Chat(_messages))
+            // Optional web search: fetch fresh results and hand them to the LLM.
+            string? webContext = null;
+            if (_client.Config.WebSearch)
+            {
+                if (string.IsNullOrEmpty(_client.Config.ExaApiKey))
+                {
+                    ErrorToast("Web search is on, but no Exa API key is set. Run /setup or /exakey to add one.");
+                }
+                else
+                {
+                    try
+                    {
+                        webContext = await _client.WebSearchAsync(userText);
+                    }
+                    catch (Exception ex) when (!_client.Config.Debug)
+                    {
+                        ErrorToast($"Exa web search failed: {ex.Message}");
+                    }
+                }
+            }
+
+            await foreach (var response in _client.Chat(_messages, webContext))
             {
                 currentMessage.Assistant += response;
                 UpdateMessagesMemo();
@@ -796,7 +586,12 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         {
             var multilinePage = new MultilineInputPage(text => _ = SendMessageAsync(text));
             var composeItem = new ListItem(multilinePage) { Title = "Compose multiline message", Subtitle = "Open a form to type or paste multiline text" };
-            _messagesMemo = sendItem.Concat(historyItems).Concat(new[] { composeItem }).ToArray();
+            var setupItem = new ListItem(new GoToPageCommand(() => new SetupPage(_client)))
+            {
+                Title = "Set up LLM chat",
+                Subtitle = "Answer a few questions to connect a model (guided setup)",
+            };
+            _messagesMemo = sendItem.Concat(historyItems).Concat([composeItem, setupItem]).ToArray();
         }
         else
         {
@@ -815,6 +610,18 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
             Duration = 10000,
         }.Show();
     }
+
+    internal static void SuccessToast(string message)
+    {
+        new ToastStatusMessage(new StatusMessage()
+        {
+            Message = message,
+            State = MessageState.Success,
+        })
+        {
+            Duration = 10000,
+        }.Show();
+    }
 }
 
 internal record SlashCommand(
@@ -823,7 +630,8 @@ internal record SlashCommand(
     Action<SendMessageCommand, object?, string>? Action = null,
     string? ActionToastText = null,
     Func<(string, string)>? Details = null,
-    string? Url = null
+    string? Url = null,
+    Func<ContentPage>? Page = null
 );
 
 internal sealed partial class SendMessageCommand : InvokableCommand
