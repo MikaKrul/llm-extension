@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stamp version from tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v?(\d+)\.(\d+)\.(\d+)$') {
+            throw "Tag '$tag' does not look like v1.2.3"
+          }
+          $version = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+          $manifestPath = "LlmExtension/Package.appxmanifest"
+          [xml]$manifest = Get-Content $manifestPath
+          $manifest.Package.Identity.Version = $version
+          $manifest.Save((Join-Path $PWD $manifestPath))
+          "Stamped package version $version"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Import signing certificate
+        shell: pwsh
+        env:
+          MSIX_CERT_B64: ${{ secrets.MSIX_SIGNING_CERT }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_SIGNING_CERT_PASSWORD }}
+        run: |
+          if (-not $env:MSIX_CERT_B64) {
+            throw "Secret MSIX_SIGNING_CERT is not configured. Generate a self-signed certificate whose subject matches the Publisher in Package.appxmanifest (CN=MikaKrul) and store it base64-encoded in this repo secret."
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\signing.pfx", [Convert]::FromBase64String($env:MSIX_CERT_B64))
+          $password = ConvertTo-SecureString -String $env:MSIX_CERT_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\signing.pfx" -Password $password -CertStoreLocation "Cert:\CurrentUser\My"
+          [IO.File]::WriteAllBytes("LlmExtension.cer", $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+          Add-Content -Path $env:GITHUB_ENV -Value "SIGNING_CERT_THUMBPRINT=$($cert.Thumbprint)"
+
+      - name: Build MSIX
+        shell: pwsh
+        run: |
+          msbuild LlmExtension/LlmExtension.csproj /restore `
+            /p:Configuration=Release `
+            /p:Platform=${{ matrix.platform }} `
+            /p:GenerateAppxPackageOnBuild=true `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:AppxPackageSigningEnabled=true `
+            /p:PackageCertificateThumbprint=$env:SIGNING_CERT_THUMBPRINT
+
+          # Stage the signed package and certificate for the artifact upload
+          $stage = "$env:RUNNER_TEMP\package"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $msix = Get-ChildItem "LlmExtension\AppPackages\*\*.msix"
+          if (-not $msix) { throw "Build produced no .msix under LlmExtension\AppPackages" }
+          $msix | Copy-Item -Destination $stage
+          Copy-Item "LlmExtension.cer" $stage
+          Get-ChildItem $stage | ForEach-Object { "Staged: $($_.Name) ($($_.Length) bytes)" }
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: msix-${{ matrix.platform }}
+          path: ${{ runner.temp }}\package\**
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: msix-*
+          merge-multiple: true
+          path: release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
