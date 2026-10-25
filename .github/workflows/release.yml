@@ -53,32 +53,36 @@ jobs:
             throw "Secret MSIX_SIGNING_CERT is not configured. Generate a self-signed certificate whose subject matches the Publisher in Package.appxmanifest (CN=MikaKrul) and store it base64-encoded in this repo secret."
           }
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\signing.pfx", [Convert]::FromBase64String($env:MSIX_CERT_B64))
-          $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new("$env:RUNNER_TEMP\signing.pfx", $env:MSIX_CERT_PASSWORD)
+          $password = ConvertTo-SecureString -String $env:MSIX_CERT_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\signing.pfx" -Password $password -CertStoreLocation "Cert:\CurrentUser\My"
           [IO.File]::WriteAllBytes("LlmExtension.cer", $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+          Add-Content -Path $env:GITHUB_ENV -Value "SIGNING_CERT_THUMBPRINT=$($cert.Thumbprint)"
 
       - name: Build MSIX
         shell: pwsh
-        env:
-          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_SIGNING_CERT_PASSWORD }}
         run: |
           msbuild LlmExtension/LlmExtension.csproj /restore `
             /p:Configuration=Release `
             /p:Platform=${{ matrix.platform }} `
             /p:GenerateAppxPackageOnBuild=true `
             /p:UapAppxPackageBuildMode=SideloadOnly `
-            /p:AppxPackageDir="$env:RUNNER_TEMP\out" `
             /p:AppxPackageSigningEnabled=true `
-            /p:PackageCertificateKeyFile="$env:RUNNER_TEMP\signing.pfx" `
-            /p:PackageCertificatePassword="$env:MSIX_CERT_PASSWORD"
+            /p:PackageCertificateThumbprint=$env:SIGNING_CERT_THUMBPRINT
+
+          # Stage the signed package and certificate for the artifact upload
+          $stage = "$env:RUNNER_TEMP\package"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $msix = Get-ChildItem "LlmExtension\AppPackages\*\*.msix"
+          if (-not $msix) { throw "Build produced no .msix under LlmExtension\AppPackages" }
+          $msix | Copy-Item -Destination $stage
+          Copy-Item "LlmExtension.cer" $stage
+          Get-ChildItem $stage | ForEach-Object { "Staged: $($_.Name) ($($_.Length) bytes)" }
 
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: msix-${{ matrix.platform }}
-          path: |
-            ${{ runner.temp }}\out\**\*.msix
-            ${{ runner.temp }}\out\**\*.cer
-            LlmExtension.cer
+          path: ${{ runner.temp }}\package\**
           if-no-files-found: error
 
   publish:
