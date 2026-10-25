@@ -322,9 +322,14 @@ internal static class ConfigStore
     public static readonly string ConfigPath = "%USERPROFILE%\\.config\\LlmExtensionForCmdPal\\config.json";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>
+    ///     Expanded path to the config file, for direct access (e.g. /config).
+    /// </summary>
+    public static string ConfigFilePath => Environment.ExpandEnvironmentVariables(ConfigPath);
+
     public static void Save(Config config)
     {
-        var path = Environment.ExpandEnvironmentVariables(ConfigPath);
+        var path = ConfigFilePath;
         var dir = Path.GetDirectoryName(path)!;
 
         if (!Directory.Exists(dir))
@@ -336,7 +341,7 @@ internal static class ConfigStore
 
     public static Config Read()
     {
-        var path = Environment.ExpandEnvironmentVariables(ConfigPath);
+        var path = ConfigFilePath;
         var dir = Path.GetDirectoryName(path)!;
 
         if (!Directory.Exists(dir))

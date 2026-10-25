@@ -5,9 +5,9 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
-using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
@@ -26,28 +26,34 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         "\n" +
         "## Setting up the extension\n" +
         "\n" +
-        "The easiest way is the setup wizard: run `/setup`, pick your service, and paste in the answers to the questions (server URL, model, API key). You can also start the wizard from the \"Set up LLM chat\" item on the main page.\n" +
+        "Run `/settings`, pick your service, and fill in the connection details (server URL, model, API key). When your configuration is incomplete, a warning item appears on the main page — press Enter on it to open the same settings form.\n" +
         "\n" +
         "- For **Ollama**, start the server yourself (`ollama serve`) and pull a model (`ollama pull llama3.1`). No API key needed.\n" +
-        "- For **OpenAI**, **AzureOpenAI**, **Google**, **Groq** or **Mistral**, create an account and an API key on the provider's website, then paste the model name and key into the wizard.\n" +
+        "- For **OpenAI**, **AzureOpenAI**, **Google**, **Groq** or **Mistral**, create an account and an API key on the provider's website, then paste the model name and key into the form.\n" +
         "- Any OpenAI-compatible API (such as Docker Model Runner) works through the **OpenAI** service by filling in its URL.\n" +
         "\n" +
         "## Web search\n" +
         "\n" +
-        "Enable web search in the last setup step (or with `/websearch`) and paste an Exa API key to let the LLM use fresh information from the web. When enabled, your message is first sent to Exa, and the results are given to the model together with your question.\n" +
+        "Enable web search in the settings form (or with `/websearch`) and paste an Exa API key to let the LLM use fresh information from the web. When enabled, your message is first sent to Exa, and the results are given to the model together with your question.\n" +
         "\n" +
         "## How to chat\n" +
         "\n" +
-        "Type your message in the search box and press Enter to send it. Press Enter on \"Compose multiline message\" to type or paste longer text. Advanced commands are still available by typing `/`:\n" +
+        $"Type your message in the search box and press Enter to send it. Messages longer than {MaxChatLength} characters, or messages with multiple lines, are opened in ChatGPT in your browser instead of being sent to the configured model. Advanced commands are still available by typing `/`:\n" +
         "\n" +
-        "- `/setup`: Run the guided setup wizard.\n" +
-        "- `/service`, `/url`, `/model`, `/apikey`: Change the connection (advanced alternative to the wizard).\n" +
+        "- `/settings`: Open the settings form to set up the extension or change any setting.\n" +
+        "- `/service`, `/url`, `/model`, `/apikey`: Change the connection (advanced alternative to the settings form).\n" +
         "- `/websearch`, `/exakey`: Toggle web search and set the Exa API key.\n" +
         "- `/system`, `/history`, `/maxtokens`, `/temperature`, `/topp`, `/detail`, `/debug`: Fine-tune the model behavior.\n" +
-        "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open the config folder, show this message.\n";
+        "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open config.json in Notepad, show this message.\n";
 
     /// <summary>
-    ///     Set by the main page and raised by the setup wizard when the
+    ///     Messages longer than this (or containing line breaks) are handed off
+    ///     to ChatGPT in the browser instead of the configured model.
+    /// </summary>
+    private const int MaxChatLength = 200;
+
+    /// <summary>
+    ///     Set by the main page and raised by the settings form when the
     ///     configuration changed, so the main page can persist and refresh its state.
     /// </summary>
     internal static Action? ConfigurationApplied;
@@ -75,9 +81,9 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         _messages = [new() { User = "", Assistant = "" }];
         _commands = new Dictionary<string, SlashCommand>()
         {
-            { "setup", new(
-                () => $"Run the guided setup wizard (current service: {_client.Config.Service})",
-                Page: () => new SetupPage(_client)
+            { "settings", new(
+                () => $"Open the settings form (current service: {_client.Config.Service})",
+                Page: () => new SettingsPage(_client)
             ) },
             { "service", new(
                 () => $"Set the API service to call (currently: {_client.Config.Service})",
@@ -299,8 +305,8 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 Details: () => ("Help message", HelpMessage)
             ) },
             { "config", new(
-                () => $"Open the folder containing the configuration file",
-                Url: Environment.ExpandEnvironmentVariables("%USERPROFILE%\\.config\\LlmExtensionForCmdPal")
+                () => "Open the configuration file (config.json) in Notepad",
+                File: ConfigStore.ConfigFilePath
             ) },
             { "debug", new(
                 () => $"Toggle printing of the complete exception (current: {_client.Config.Debug})",
@@ -372,10 +378,10 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
 
             if (_client.MissingConfigs.Any())
             {
-                return [new ListItem(new GoToPageCommand(() => new SetupPage(_client))) {
+                return [new ListItem(new SettingsPage(_client)) {
                     Icon = new IconInfo("\u26A0"),
                     Title = $"Configuration incomplete for {_client.Config.Service}",
-                    Subtitle = $"Missing: {string.Join(", ", _client.MissingConfigs)} — press Enter to answer the setup questions" }];
+                    Subtitle = $"Missing: {string.Join(", ", _client.MissingConfigs)} — press Enter to open the settings form" }];
             }
 
             return _messagesMemo;
@@ -403,14 +409,16 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     {
         _commandsMemo = _commands.Select(c =>
         {
+            // A ListItem whose command IS a page makes the host navigate to that
+            // page; the GoToPage command result is not implemented by the host.
             ICommand command = c.Value.Action != null
                 ? SendMessageCommand.CreateCommand(c.Key, c.Value, () => SearchText, _client.Config.Debug)
                 : c.Value.Page != null
-                    ? new GoToPageCommand(c.Value.Page)
+                    ? c.Value.Page()
                     : c.Value.Details != null
                         ? new MarkdownPage(c.Value.Details.Invoke().Item1, c.Value.Details.Invoke().Item2)
-                        : c.Value.Url != null
-                            ? new OpenUrlCommand(c.Value.Url)
+                        : c.Value.File != null
+                            ? new OpenFileCommand(c.Value.File)
                             : new NoOpCommand();
 
             if (c.Value.Action != null)
@@ -449,13 +457,20 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     }
 
     /// <summary>
-    ///     Shared send-message logic used by both the search-box path (SendMessageCommand)
-    ///     and the multiline form path (MultilineInputPage callback).
+    ///     Send-message logic for the search-box path (SendMessageCommand).
     /// </summary>
     private async Task SendMessageAsync(string userText)
     {
         if (IsLoading) return;
         if (string.IsNullOrWhiteSpace(userText)) return;
+
+        // The palette's input is a single line — long or multiline messages are
+        // opened in ChatGPT in the browser with the message as the query.
+        if (userText.Contains('\r') || userText.Contains('\n') || userText.Length > MaxChatLength)
+        {
+            HandOffToChatGpt(userText);
+            return;
+        }
 
         var currentMessage = _messages[0];
         try
@@ -475,7 +490,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
             {
                 if (string.IsNullOrEmpty(_client.Config.ExaApiKey))
                 {
-                    ErrorToast("Web search is on, but no Exa API key is set. Run /setup or /exakey to add one.");
+                    ErrorToast("Web search is on, but no Exa API key is set. Run /settings or /exakey to add one.");
                 }
                 else
                 {
@@ -534,6 +549,31 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         }
     }
 
+    /// <summary>
+    ///     Opens ChatGPT in the default browser with the message as the query
+    ///     parameter, then clears the draft in the palette.
+    /// </summary>
+    private void HandOffToChatGpt(string userText)
+    {
+        var url = $"https://chatgpt.com/?q={Uri.EscapeDataString(userText)}";
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            SuccessToast("Message opened in ChatGPT in your browser");
+        }
+        catch (Exception ex)
+        {
+            ErrorToast($"Could not open ChatGPT: {ex.Message}");
+        }
+
+        _messages[0].User = "";
+        SearchText = "";
+        OnPropertyChanged(nameof(SearchText));
+        UpdateMessagesMemo();
+        RaiseItemsChanged();
+    }
+
     private void UpdateMessagesMemo()
     {
         var sendItem = new List<ListItem>();
@@ -545,7 +585,8 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
             {
                 if (string.IsNullOrEmpty(m.User))
                 {
-                    // Idle slot — no item; compose button is inserted separately below.
+                    // Idle slot — no item; an idle hint is inserted below when
+                    // nothing else is left to show.
                 }
                 else if (index == 0)
                 {
@@ -584,14 +625,19 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
 
         if (!IsLoading)
         {
-            var multilinePage = new MultilineInputPage(text => _ = SendMessageAsync(text));
-            var composeItem = new ListItem(multilinePage) { Title = "Compose multiline message", Subtitle = "Open a form to type or paste multiline text" };
-            var setupItem = new ListItem(new GoToPageCommand(() => new SetupPage(_client)))
+            var items = sendItem.Concat(historyItems).ToList();
+
+            if (items.Count == 0)
             {
-                Title = "Set up LLM chat",
-                Subtitle = "Answer a few questions to connect a model (guided setup)",
-            };
-            _messagesMemo = sendItem.Concat(historyItems).Concat([composeItem, setupItem]).ToArray();
+                // Nothing to show yet — hint how to start instead of an empty list.
+                items.Add(new ListItem(new NoOpCommand())
+                {
+                    Title = "Type a message to chat",
+                    Subtitle = "Press Enter to send — '/settings' to configure, '/help' for all commands",
+                });
+            }
+
+            _messagesMemo = items.ToArray();
         }
         else
         {
@@ -630,7 +676,7 @@ internal sealed record SlashCommand(
     Action<SendMessageCommand, object?, string>? Action = null,
     string? ActionToastText = null,
     Func<(string, string)>? Details = null,
-    string? Url = null,
+    string? File = null,
     Func<ContentPage>? Page = null
 );
 
@@ -739,83 +785,31 @@ internal sealed partial class MarkdownPage : ContentPage
 }
 
 /// <summary>
-///     A ContentPage that hosts a multiline text input form.
-///     Navigated to when the user wants to paste or type a multiline message.
-///     On submit, fires the OnMessageSubmitted callback with the entered text.
+///     Opens a file in Notepad. Used by /config for direct access to
+///     config.json.
 /// </summary>
-internal sealed partial class MultilineInputPage : ContentPage
+internal sealed partial class OpenFileCommand : InvokableCommand
 {
-    private readonly MultilineInputForm _form;
+    private readonly string _filePath;
 
-    public MultilineInputPage(Action<string> onMessageSubmitted)
+    public OpenFileCommand(string filePath, string? name = null)
     {
-        Title = "Compose Message";
-        Name = "Compose multiline message";
-        Icon = new IconInfo("\uE932"); // Segoe UI "Edit" glyph
-
-        _form = new MultilineInputForm(onMessageSubmitted);
+        _filePath = filePath;
+        Name = name ?? "Open file";
     }
 
-    public override IContent[] GetContent()
+    public override ICommandResult Invoke()
     {
-        return [_form];
-    }
-}
-
-/// <summary>
-///     A FormContent using an Adaptive Card with isMultiline=true on the text input.
-/// </summary>
-internal sealed partial class MultilineInputForm : FormContent
-{
-    private readonly Action<string> _onMessageSubmitted;
-
-    public MultilineInputForm(Action<string> onMessageSubmitted)
-    {
-        _onMessageSubmitted = onMessageSubmitted;
-
-        // Adaptive Card JSON with "isMultiline": true renders a multiline textarea.
-        TemplateJson = """
+        try
         {
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "type": "AdaptiveCard",
-            "version": "1.6",
-            "body": [
-                {
-                    "type": "Input.Text",
-                    "id": "message",
-                    "label": "Message",
-                    "placeholder": "Type or paste your multiline message here...",
-                    "isMultiline": true,
-                    "isRequired": true,
-                    "errorMessage": "Message cannot be empty"
-                }
-            ],
-            "actions": [
-                {
-                    "type": "Action.Submit",
-                    "title": "Send"
-                }
-            ]
+            Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_filePath}\"") { UseShellExecute = true });
         }
-        """;
-    }
-
-    public override CommandResult SubmitForm(string payload)
-    {
-        var formInput = JsonNode.Parse(payload)?.AsObject();
-        if (formInput == null)
+        catch (Exception ex)
         {
-            return CommandResult.GoBack();
-        }
-
-        var message = formInput["message"]?.ToString();
-        if (string.IsNullOrWhiteSpace(message))
-        {
+            LlmExtensionPage.ErrorToast($"Could not open '{_filePath}': {ex.Message}");
             return CommandResult.KeepOpen();
         }
 
-        _onMessageSubmitted(message);
-
-        return CommandResult.GoBack();
+        return CommandResult.Dismiss();
     }
 }
