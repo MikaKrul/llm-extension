@@ -167,7 +167,7 @@ internal sealed partial class SettingsForm : FormContent
                 "Only the fields the picked service needs are validated.",
                 subtle: true),
             AdaptiveCards.ChoiceSet("service", "Service", ServiceChoices, ServiceChoiceFor(config.Service)),
-            AdaptiveCards.TextField("model", "Model", ModelPlaceholder(config.Service), config.Model ?? "", required: true),
+            AdaptiveCards.TextField("model", "Model — or run /models in the chat to pick from the provider's live list", ModelPlaceholder(config.Service), config.Model ?? "", required: true),
             AdaptiveCards.TextField(
                 "url",
                 "Server URL — required for Ollama and Azure OpenAI, optional for the rest",
@@ -183,8 +183,8 @@ internal sealed partial class SettingsForm : FormContent
             AdaptiveCards.Toggle("websearch", "Let the LLM search the web (Exa)", config.WebSearch),
             AdaptiveCards.TextField(
                 "exakey",
-                "Exa API key — only needed when web search is on",
-                "Leave empty to keep the current key",
+                "Exa API key — optional; without a key, free keyless search is used",
+                "Leave empty to keep the current key (or to use keyless search)",
                 config.ExaApiKey ?? "",
                 required: false));
     }
@@ -272,11 +272,7 @@ internal sealed partial class SettingsForm : FormContent
             return CommandResult.KeepOpen();
         }
 
-        if (webSearch && string.IsNullOrEmpty(exaKey) && string.IsNullOrEmpty(_client.Config.ExaApiKey))
-        {
-            LlmExtensionPage.ErrorToast("Web search needs an Exa API key. Paste one (from dashboard.exa.ai), or switch the toggle off.");
-            return CommandResult.KeepOpen();
-        }
+        // Web search without an Exa key is allowed: keyless search is used.
 
         _client.Config.Service = service.Value;
         _client.Config.Model = model;

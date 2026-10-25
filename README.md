@@ -18,10 +18,13 @@ It currently supports the following APIs:
 Features:
 
 - **One simple settings form** — type `/settings`, pick your service and paste in the connection details. No wizard, no `/` commands needed to get started.
+- **Live model picker** — type `/models` to fetch the list of models straight from your provider and pick one.
+- **Streaming responses** — answers stream in live, with a status line showing the live **tok/s** while generating, plus tokens, duration and **which tools** (such as web search) were used per answer.
+- **Web search with Exa** (optional) — let the LLM answer using fresh results from the web. Works **without an API key** (free keyless search, rate-limited); paste a key from the [Exa dashboard](https://dashboard.exa.ai/) for the full API.
+- **Clear error messages** — rejected API keys, wrong model names, unreachable servers and rate limits each get their own actionable hint.
 - **Direct access to `config.json`** — type `/config` to open the raw configuration file in Notepad.
-- **Web search with Exa** (optional) — let the LLM answer using fresh results from the web.
 - **ChatGPT hand-off** — messages longer than 200 characters (or with multiple lines) open in ChatGPT in your browser instead of the configured model.
-- Streaming responses, Markdown rendering and conversation history.
+- Markdown rendering and conversation history.
 
 ## Requirements
 
@@ -52,10 +55,10 @@ msbuild LlmExtension\LlmExtension.csproj /restore /p:Configuration=Release /p:Pl
 Open Command Palette → **LLM Chat** → type `/settings`. The form shows all settings at once, prefilled with your current configuration:
 
 - **Service** — Ollama, OpenAI (or any OpenAI-compatible API, such as Docker Model Runner), Azure OpenAI, Google Gemini, Groq or Mistral.
-- **Model** — the model to use (for Azure OpenAI, the name of your deployment).
+- **Model** — the model to use (for Azure OpenAI, the name of your deployment). Or run `/models` in the chat to pick one from the live list at your provider.
 - **Server URL** — required for Ollama (default `http://localhost:11434/`) and Azure OpenAI; optional for the rest.
 - **API key** — not needed for Ollama; for the other services, paste the key from the provider's website.
-- **Web search** — toggle to let the LLM use [Exa](https://exa.ai/) web search, and paste your Exa API key (from the [Exa dashboard](https://dashboard.exa.ai/)).
+- **Web search** — toggle to let the LLM use [Exa](https://exa.ai/) web search. An Exa API key is optional: without one, free keyless search is used (rate-limited).
 
 Press **Save settings** and you're done. If your configuration is incomplete, a warning item appears on the main page of the extension — press Enter on it to open the same form.
 
