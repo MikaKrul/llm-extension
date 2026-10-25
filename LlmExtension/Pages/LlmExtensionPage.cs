@@ -47,10 +47,10 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open the config folder, show this message.\n";
 
     /// <summary>
-    ///     Raised by the setup wizard when the configuration changed, so the main
-    ///     page can persist and refresh its state.
+    ///     Set by the main page and raised by the setup wizard when the
+    ///     configuration changed, so the main page can persist and refresh its state.
     /// </summary>
-    internal static event Action? ConfigurationApplied;
+    internal static Action? ConfigurationApplied;
 
     private readonly Client _client;
     private readonly IList<ChatMessage> _messages;
@@ -624,7 +624,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     }
 }
 
-internal record SlashCommand(
+internal sealed record SlashCommand(
     Func<string> Description,
     string? Param = null,
     Action<SendMessageCommand, object?, string>? Action = null,

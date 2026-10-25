@@ -160,6 +160,11 @@ internal class Client
                 Temperature = Config.Temperature,
                 TopP = Config.TopP == 1.0f ? null : Config.TopP,
             },
+            _ => new OpenAIPromptExecutionSettings()
+            {
+                MaxTokens = Config.MaxTokens,
+                Temperature = Config.Temperature,
+            },
         };
 
         await foreach (var content in ChatService.GetStreamingChatMessageContentsAsync(history, settings))
