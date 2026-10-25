@@ -30,7 +30,7 @@ internal sealed partial class ModelsPage : DynamicListPage
     public ModelsPage(Client client)
     {
         _client = client;
-        _itemsChanged = new ItemsChangedThrottle(RaiseItemsChanged, 90);
+        _itemsChanged = new ItemsChangedThrottle(() => RaiseItemsChanged(), 90);
 
         Icon = new IconInfo("\uE713");
         Title = "Pick a model";

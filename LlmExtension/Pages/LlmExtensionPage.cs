@@ -95,7 +95,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         PlaceholderText = "Type here to chat, or start with '/' to use commands";
         ShowDetails = true;
 
-        _itemsChanged = new ItemsChangedThrottle(RaiseItemsChanged, 90);
+        _itemsChanged = new ItemsChangedThrottle(() => RaiseItemsChanged(), 90);
 
         _client = new Client()
         {
@@ -838,7 +838,7 @@ internal sealed record SlashCommand(
     string? ActionToastText = null,
     Func<(string, string)>? Details = null,
     string? File = null,
-    Func<ContentPage>? Page = null
+    Func<ICommand>? Page = null
 );
 
 internal sealed partial class SendMessageCommand : InvokableCommand
