@@ -5,9 +5,10 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
-using System.Text.Json.Nodes;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
@@ -26,28 +27,39 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         "\n" +
         "## Setting up the extension\n" +
         "\n" +
-        "The easiest way is the setup wizard: run `/setup`, pick your service, and paste in the answers to the questions (server URL, model, API key). You can also start the wizard from the \"Set up LLM chat\" item on the main page.\n" +
+        "Run `/settings`, pick your service, and fill in the connection details (server URL, model, API key). When your configuration is incomplete, a warning item appears on the main page — press Enter on it to open the same settings form.\n" +
         "\n" +
         "- For **Ollama**, start the server yourself (`ollama serve`) and pull a model (`ollama pull llama3.1`). No API key needed.\n" +
-        "- For **OpenAI**, **AzureOpenAI**, **Google**, **Groq** or **Mistral**, create an account and an API key on the provider's website, then paste the model name and key into the wizard.\n" +
+        "- For **OpenAI**, **AzureOpenAI**, **Google**, **Groq** or **Mistral**, create an account and an API key on the provider's website, then paste the model name and key into the form.\n" +
         "- Any OpenAI-compatible API (such as Docker Model Runner) works through the **OpenAI** service by filling in its URL.\n" +
         "\n" +
         "## Web search\n" +
         "\n" +
-        "Enable web search in the last setup step (or with `/websearch`) and paste an Exa API key to let the LLM use fresh information from the web. When enabled, your message is first sent to Exa, and the results are given to the model together with your question.\n" +
+        "Turn web search on with `/websearch` (or in the settings form) and your message is first sent to Exa, whose results are given to the model together with your question. **Without an Exa API key, a free keyless search is used** (rate-limited); paste a key from dashboard.exa.ai for the full API.\n" +
+        "\n" +
+        "## Streaming, speed and tools\n" +
+        "\n" +
+        "Answers stream in live while the model writes. Above every new answer a status line shows the live speed, and after it finishes you'll see how fast it was (`tok/s`), how many tokens it used, and which tools (such as web search) were used.\n" +
         "\n" +
         "## How to chat\n" +
         "\n" +
-        "Type your message in the search box and press Enter to send it. Press Enter on \"Compose multiline message\" to type or paste longer text. Advanced commands are still available by typing `/`:\n" +
+        $"Type your message in the search box and press Enter to send it. Messages longer than {MaxChatLength} characters, or messages with multiple lines, are opened in ChatGPT in your browser instead of being sent to the configured model. Advanced commands are still available by typing `/`:\n" +
         "\n" +
-        "- `/setup`: Run the guided setup wizard.\n" +
-        "- `/service`, `/url`, `/model`, `/apikey`: Change the connection (advanced alternative to the wizard).\n" +
-        "- `/websearch`, `/exakey`: Toggle web search and set the Exa API key.\n" +
+        "- `/settings`: Open the settings form to set up the extension or change any setting.\n" +
+        "- `/models`: Fetch the live list of models from your provider and pick one.\n" +
+        "- `/service`, `/url`, `/model`, `/apikey`: Change the connection (advanced alternative to the settings form).\n" +
+        "- `/websearch`, `/exakey`: Toggle web search and set the Exa API key (optional — keyless search works without one).\n" +
         "- `/system`, `/history`, `/maxtokens`, `/temperature`, `/topp`, `/detail`, `/debug`: Fine-tune the model behavior.\n" +
-        "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open the config folder, show this message.\n";
+        "- `/clear`, `/reset`, `/config`, `/help`: Clear history, reset settings, open config.json in Notepad, show this message.\n";
 
     /// <summary>
-    ///     Set by the main page and raised by the setup wizard when the
+    ///     Messages longer than this (or containing line breaks) are handed off
+    ///     to ChatGPT in the browser instead of the configured model.
+    /// </summary>
+    private const int MaxChatLength = 200;
+
+    /// <summary>
+    ///     Set by the main page and raised by the settings form when the
     ///     configuration changed, so the main page can persist and refresh its state.
     /// </summary>
     internal static Action? ConfigurationApplied;
@@ -55,9 +67,25 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     private readonly Client _client;
     private readonly IList<ChatMessage> _messages;
     private readonly IDictionary<string, SlashCommand> _commands;
+    private readonly ItemsChangedThrottle _itemsChanged;
 
     private (string, ListItem)[] _commandsMemo;
     private ListItem[] _messagesMemo;
+
+    /// <summary>
+    ///     Live state of the response currently being streamed, used for the
+    ///     live "tokens · tok/s" status item.
+    /// </summary>
+    private long _streamStartTimestamp;
+    private int _streamTokens;
+    private long _streamFirstTokenMs;
+    private bool _searchingWeb;
+
+    /// <summary>
+    ///     Friendly message of the last failed chat attempt, shown as an item
+    ///     in the list until the next message is sent.
+    /// </summary>
+    private string? _lastError;
 
     public LlmExtensionPage()
     {
@@ -67,17 +95,21 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
         PlaceholderText = "Type here to chat, or start with '/' to use commands";
         ShowDetails = true;
 
+        _itemsChanged = new ItemsChangedThrottle(() => RaiseItemsChanged(), 90);
+
         _client = new Client()
         {
             Config = ConfigStore.Read()
         };
+        ExtLog.Enabled = _client.Config.Debug;
+        ExtLog.Log("extension page constructed");
         _client.ReinitializeService();
         _messages = [new() { User = "", Assistant = "" }];
         _commands = new Dictionary<string, SlashCommand>()
         {
-            { "setup", new(
-                () => $"Run the guided setup wizard (current service: {_client.Config.Service})",
-                Page: () => new SetupPage(_client)
+            { "settings", new(
+                () => $"Open the settings form (current service: {_client.Config.Service})",
+                Page: () => new SettingsPage(_client)
             ) },
             { "service", new(
                 () => $"Set the API service to call (currently: {_client.Config.Service})",
@@ -113,7 +145,9 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 Action: (sender, args, opts) => {
                     _messages.Clear();
                     _messages.Add(new() { User = "", Assistant = "" });
-                    RaiseItemsChanged();
+                    _lastError = null;
+                    UpdateMessagesMemo();
+                    _itemsChanged.Schedule();
                 },
                 ActionToastText: "Message cleared")
             },
@@ -137,6 +171,10 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 },
                 "Model configured")
             },
+            { "models", new(
+                () => $"Pick a model from the live {(_client.Config.Service.ToString().ToLowerInvariant())} list (current: {_client.Config.Model})",
+                Page: () => new ModelsPage(_client)
+            ) },
             { "apikey", new(
                 () => $"Set the API key (Ollama not applicable)",
                 "<api-key>",
@@ -148,7 +186,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 "API key configured")
             },
             { "websearch", new(
-                () => $"Toggle Exa web search for your messages (current: {(_client.Config.WebSearch ? "on" : "off")})",
+                () => $"Toggle Exa web search for your messages (current: {(_client.Config.WebSearch ? "on" : "off")}). Without an Exa key, free keyless search is used",
                 Action: (sender, args, opts) =>
                 {
                     _client.Config.WebSearch = !_client.Config.WebSearch;
@@ -157,7 +195,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 ActionToastText: "Web search toggled")
             },
             { "exakey", new(
-                () => $"Set the Exa API key for web search",
+                () => $"Set the Exa API key for web search (optional \u2014 without a key, free keyless search is used)",
                 "<exa-api-key>",
                 (sender, args, opts) =>
                 {
@@ -299,8 +337,8 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                 Details: () => ("Help message", HelpMessage)
             ) },
             { "config", new(
-                () => $"Open the folder containing the configuration file",
-                Url: Environment.ExpandEnvironmentVariables("%USERPROFILE%\\.config\\LlmExtensionForCmdPal")
+                () => "Open the configuration file (config.json) in Notepad",
+                File: ConfigStore.ConfigFilePath
             ) },
             { "debug", new(
                 () => $"Toggle printing of the complete exception (current: {_client.Config.Debug})",
@@ -330,19 +368,22 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
 
     public override void UpdateSearchText(string oldSearch, string newSearch)
     {
-        if (string.IsNullOrEmpty(oldSearch) != string.IsNullOrEmpty(newSearch) || oldSearch.StartsWith('/') != newSearch.StartsWith('/'))
+        ExtLog.Log($"UpdateSearchText: '{oldSearch}' -> '{newSearch}'");
+
+        if (!IsLoading)
         {
-            if (!IsLoading)
-            {
-                _messages[0].User = newSearch;
-            }
+            // Slash commands are not part of the chat draft.
+            _messages[0].User = newSearch.StartsWith('/') ? string.Empty : newSearch;
             UpdateMessagesMemo();
-            RaiseItemsChanged();
         }
-        else if (newSearch.StartsWith('/'))
-        {
-            RaiseItemsChanged();
-        }
+
+        // Never raise ItemsChanged from inside the SearchText setter itself:
+        // doing so forces the host into a nested GetItems RPC on the same
+        // exclusive thread while this call is still in flight, which stalls the
+        // pipeline once it happens on every keystroke (typing "/settings"
+        // would leave the stale chat list on screen). A short throttled raise
+        // on a worker thread keeps the '/' command list updating reliably.
+        _itemsChanged.Schedule();
     }
 
     public override IListItem[] GetItems()
@@ -358,7 +399,7 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                     commandText = commandText[..commandText.IndexOf(' ')];
                 }
 
-                return _commandsMemo
+                var commands = _commandsMemo
                     .OrderByDescending(c => c.Item1.Zip(commandText).TakeWhile((pair) => pair.First == pair.Second).Count())
                     .Select(c => // Shallow copy so that item selection/highlight won't stick to the previous first item
                     new ListItem(c.Item2)
@@ -368,20 +409,25 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                         Details = c.Item2.Details,
                     })
                     .ToArray();
+
+                ExtLog.Log($"GetItems: {commands.Length} command items for '{SearchText}'");
+                return commands;
             }
 
             if (_client.MissingConfigs.Any())
             {
-                return [new ListItem(new GoToPageCommand(() => new SetupPage(_client))) {
+                return [new ListItem(new SettingsPage(_client)) {
                     Icon = new IconInfo("\u26A0"),
                     Title = $"Configuration incomplete for {_client.Config.Service}",
-                    Subtitle = $"Missing: {string.Join(", ", _client.MissingConfigs)} — press Enter to answer the setup questions" }];
+                    Subtitle = $"Missing: {string.Join(", ", _client.MissingConfigs)} — press Enter to open the settings form" }];
             }
 
+            ExtLog.Log($"GetItems: {_messagesMemo.Length} chat items (loading: {IsLoading})");
             return _messagesMemo;
         }
         catch (Exception ex)
         {
+            ExtLog.LogError($"GetItems failed: {ex}");
             ErrorToast(_client.Config.Debug ? ex.ToString() : "An unexpected error occurred");
             IsLoading = false;
 
@@ -393,25 +439,36 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     {
         _client.ReinitializeService();
         ConfigStore.Save(_client.Config);
-        SearchText = "";
+        ExtLog.Enabled = _client.Config.Debug;
+        SetSearchNoUpdate(string.Empty);
+        OnPropertyChanged(nameof(SearchText));
         UpdateCommandsMemo();
         UpdateMessagesMemo();
-        RaiseItemsChanged();
+        _itemsChanged.Schedule();
     }
 
     private void UpdateCommandsMemo()
     {
         _commandsMemo = _commands.Select(c =>
         {
+            // A ListItem whose command IS a page makes the host navigate to that
+            // page; the GoToPage command result is not implemented by the host.
             ICommand command = c.Value.Action != null
                 ? SendMessageCommand.CreateCommand(c.Key, c.Value, () => SearchText, _client.Config.Debug)
                 : c.Value.Page != null
-                    ? new GoToPageCommand(c.Value.Page)
+                    ? c.Value.Page()
                     : c.Value.Details != null
                         ? new MarkdownPage(c.Value.Details.Invoke().Item1, c.Value.Details.Invoke().Item2)
-                        : c.Value.Url != null
-                            ? new OpenUrlCommand(c.Value.Url)
+                        : c.Value.File != null
+                            ? new OpenFileCommand(c.Value.File)
                             : new NoOpCommand();
+
+            if (command is Command toolkitCommand)
+            {
+                // A stable, unique id per slash command helps the host track
+                // the command across refetches.
+                toolkitCommand.Id = $"llmext.cmd.{c.Key}";
+            }
 
             if (c.Value.Action != null)
             {
@@ -449,103 +506,228 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
     }
 
     /// <summary>
-    ///     Shared send-message logic used by both the search-box path (SendMessageCommand)
-    ///     and the multiline form path (MultilineInputPage callback).
+    ///     Send-message logic for the search-box path (SendMessageCommand).
+    ///     Streams the response chunk by chunk, keeping the visible list
+    ///     updated at a throttled rate, and records speed + tool usage.
     /// </summary>
     private async Task SendMessageAsync(string userText)
     {
         if (IsLoading) return;
         if (string.IsNullOrWhiteSpace(userText)) return;
 
+        // The palette's input is a single line — long or multiline messages are
+        // opened in ChatGPT in the browser with the message as the query.
+        if (userText.Contains('\r') || userText.Contains('\n') || userText.Length > MaxChatLength)
+        {
+            HandOffToChatGpt(userText);
+            return;
+        }
+
+        ExtLog.Log($"SendMessageAsync: '{userText}'");
+
         var currentMessage = _messages[0];
         try
         {
-            currentMessage.User = userText;
+            _lastError = null;
             IsLoading = true;
+            _searchingWeb = false;
+            _streamTokens = 0;
+            _streamFirstTokenMs = 0;
+            _streamStartTimestamp = Stopwatch.GetTimestamp();
 
-            SearchText = "";
+            // Clear the palette's search box without going through the
+            // SearchText setter (its UpdateSearchText side effect would clobber
+            // the draft we set right after), then tell the host it changed.
+            SetSearchNoUpdate(string.Empty);
             OnPropertyChanged(nameof(SearchText));
 
+            currentMessage.User = userText;
+            currentMessage.Assistant = string.Empty;
+            currentMessage.Stats = null;
+            currentMessage.Tools = null;
+
             UpdateMessagesMemo();
-            RaiseItemsChanged();
+            _itemsChanged.Schedule();
 
             // Optional web search: fetch fresh results and hand them to the LLM.
+            // With an Exa API key this uses the REST API; without one, Exa's
+            // free keyless MCP endpoint is used.
             string? webContext = null;
             if (_client.Config.WebSearch)
             {
-                if (string.IsNullOrEmpty(_client.Config.ExaApiKey))
-                {
-                    ErrorToast("Web search is on, but no Exa API key is set. Run /setup or /exakey to add one.");
-                }
-                else
-                {
-                    try
-                    {
-                        webContext = await _client.WebSearchAsync(userText);
-                    }
-                    catch (Exception ex) when (!_client.Config.Debug)
-                    {
-                        ErrorToast($"Exa web search failed: {ex.Message}");
-                    }
-                }
-            }
-
-            await foreach (var response in _client.Chat(_messages, webContext))
-            {
-                currentMessage.Assistant += response;
+                _searchingWeb = true;
                 UpdateMessagesMemo();
-                RaiseItemsChanged();
+                _itemsChanged.Schedule();
+
+                try
+                {
+                    var search = await _client.WebSearchAsync(userText);
+                    if (search != null)
+                    {
+                        webContext = search.Context;
+                        currentMessage.Tools = search.Source;
+                        ExtLog.Log($"web search ok via {search.Source}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ExtLog.LogError($"web search failed: {ex}");
+                    ErrorToast($"Web search failed: {ex.Message} — the model will answer from its own knowledge.");
+                }
+
+                _searchingWeb = false;
             }
 
-            SearchText = "";
+            var watch = Stopwatch.StartNew();
+            await foreach (var chunk in _client.Chat(_messages, webContext))
+            {
+                currentMessage.Assistant += chunk;
+                _streamTokens++;
+
+                if (_streamFirstTokenMs == 0)
+                {
+                    _streamFirstTokenMs = watch.ElapsedMilliseconds;
+                }
+
+                // Rebuild the memo with the growing answer, but let the throttle
+                // coalesce the raises: a raise per streamed token floods the host
+                // with a full item re-fetch per token and makes the list thrash
+                // instead of stream.
+                UpdateMessagesMemo();
+                _itemsChanged.Schedule();
+            }
+
+            var totalMs = watch.ElapsedMilliseconds;
+            var generationMs = Math.Max(1, totalMs - _streamFirstTokenMs);
+            var tokensPerSecond = _streamTokens / (generationMs / 1000.0);
+            currentMessage.Stats = $"{tokensPerSecond:F0} tok/s · {_streamTokens} tokens · {totalMs / 1000.0:F1} s";
+
             _messages.Insert(0, new() { User = "", Assistant = "" });
+            ExtLog.Log($"chat done: {currentMessage.Stats}, tools: {currentMessage.Tools ?? "none"}");
         }
-        catch (Exception ex) when (!_client.Config.Debug && (ex is HttpRequestException || ex is ClientResultException))
+        catch (Exception ex) when (!_client.Config.Debug && (ex is HttpOperationException || ex is HttpRequestException || ex is ClientResultException))
         {
-            ErrorToast(
-                $"Error calling API over HTTP, is there a '{_client.Config.Service}' server running and accepting connections " +
-                $"at '{_client.Config.Url}' with model '{_client.Config.Model}'? Or perhaps the API key is incorrect?"
-                );
-        }
-        catch (HttpOperationException ex) when (_client.Config.Debug)
-        {
-            var dataString = "";
-            foreach (DictionaryEntry item in ex.Data)
-            {
-                dataString += $"{item.Key}: {item.Value}\n";
-            }
-
-            if (!string.IsNullOrEmpty(dataString))
-            {
-                dataString = "\n" + dataString;
-            }
-
-            ErrorToast($"An HTTP error occurred: {ex.Message} with inner exception {ex.InnerException}{dataString}");
+            ExtLog.LogError($"chat failed: {ex}");
+            var friendly = Errors.DescribeHttpException(ex, _client.Config);
+            _lastError = friendly;
+            ErrorToast(friendly);
         }
         catch (Exception ex)
         {
-            ErrorToast(_client.Config.Debug ? ex.ToString() : "An error occurred when attempting to chat with LLM");
+            ExtLog.LogError($"chat failed: {ex}");
+
+            var detail = ex is HttpOperationException http && !string.IsNullOrEmpty(http.ResponseContent)
+                ? $"\n\nResponse: {TextUtils.OneLine(http.ResponseContent, 300)}"
+                : string.Empty;
+            var message = _client.Config.Debug ? ex + detail : $"Something went wrong while chatting with {_client.Config.Service}: {TextUtils.OneLine(ex.Message, 200)}";
+            _lastError = message;
+            ErrorToast(message);
         }
         finally
         {
+            _searchingWeb = false;
             IsLoading = false;
             UpdateMessagesMemo();
-            RaiseItemsChanged();
+            _itemsChanged.Schedule();
+        }
+    }
+
+    /// <summary>
+    ///     Opens ChatGPT in the default browser with the message as the query
+    ///     parameter, then clears the draft in the palette.
+    /// </summary>
+    private void HandOffToChatGpt(string userText)
+    {
+        var url = $"https://chatgpt.com/?q={Uri.EscapeDataString(userText)}";
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            SuccessToast("Message opened in ChatGPT in your browser");
+        }
+        catch (Exception ex)
+        {
+            ErrorToast($"Could not open ChatGPT: {ex.Message}");
+        }
+
+        _messages[0].User = "";
+        SetSearchNoUpdate(string.Empty);
+        OnPropertyChanged(nameof(SearchText));
+        UpdateMessagesMemo();
+        _itemsChanged.Schedule();
+    }
+
+    /// <summary>
+    ///     Live tokens/second while a response is streaming in, measured from
+    ///     the first received token.
+    /// </summary>
+    private double LiveTokensPerSecond
+    {
+        get
+        {
+            if (_streamFirstTokenMs <= 0)
+            {
+                return 0;
+            }
+
+            var elapsedMs = Stopwatch.GetElapsedTime(_streamStartTimestamp).TotalMilliseconds - _streamFirstTokenMs;
+            return _streamTokens / Math.Max(0.001, elapsedMs / 1000.0);
         }
     }
 
     private void UpdateMessagesMemo()
     {
-        var sendItem = new List<ListItem>();
-        var historyItems = new List<ListItem>();
+        var items = new List<ListItem>();
 
+        if (!IsLoading && _lastError != null)
+        {
+            items.Add(new ListItem(new NoOpCommand())
+            {
+                Icon = new IconInfo("\uE7BA"),
+                Title = "Something went wrong",
+                Subtitle = TextUtils.OneLine(_lastError),
+                Details = new Details()
+                {
+                    Title = "Error details",
+                    Body = _lastError,
+                },
+            });
+        }
+
+        if (IsLoading)
+        {
+            // Live status line so the generation is visible in every layout,
+            // including the compact docked palette: speed while streaming,
+            // or what the extension is waiting on before the first token.
+            var streamingText = _messages.Count > 0 ? _messages[0].Assistant : string.Empty;
+            var title = _searchingWeb
+                ? "Searching the web for fresh results..."
+                : _streamTokens > 0
+                    ? $"{_streamTokens} tokens · {LiveTokensPerSecond:F0} tok/s"
+                    : "Waiting for the model...";
+            var subtitle = _searchingWeb
+                ? "Exa web search is running"
+                : string.IsNullOrEmpty(streamingText)
+                    ? string.Empty
+                    : TextUtils.OneLine(streamingText);
+
+            items.Add(new ListItem(new NoOpCommand())
+            {
+                Icon = new IconInfo("\uE72C"),
+                Title = title,
+                Subtitle = subtitle,
+            });
+        }
+
+        var firstResponse = true;
         foreach (var (m, index) in _messages.Select((m, i) => (m, i)))
         {
             if (string.IsNullOrEmpty(m.Assistant))
             {
                 if (string.IsNullOrEmpty(m.User))
                 {
-                    // Idle slot — no item; compose button is inserted separately below.
+                    // Idle slot — no item; an idle hint is inserted below when
+                    // nothing else is left to show.
                 }
                 else if (index == 0)
                 {
@@ -553,17 +735,35 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                     {
                         var command = new SendMessageCommand() { Debug = _client.Config.Debug };
                         command.SendMessage += async (sender, args) => await SendMessageAsync(SearchText);
-                        sendItem.Add(new ListItem(command) { Title = "Press enter to send" });
+                        items.Add(new ListItem(command) { Title = "Press enter to send", Subtitle = "The answer streams in live, with its speed and tools" });
                     }
                 }
                 else
                 {
-                    historyItems.Add(new ListItem(new DetailedResponsePage(m.User, "No response received.")) { Title = m.User, Subtitle = "No response received." });
+                    items.Add(new ListItem(new DetailedResponsePage(m.User, "No response received.")) { Title = m.User, Subtitle = "No response received." });
                 }
             }
             else
             {
-                var item = new ListItem(new DetailedResponsePage(m.User, m.Assistant))
+                // The newest exchange gets a visible status line: how fast the
+                // model was and which tools (like web search) were used. Older
+                // exchanges carry the same info in their details footer.
+                if (firstResponse)
+                {
+                    firstResponse = false;
+                    if (m.Stats != null)
+                    {
+                        items.Add(new ListItem(new NoOpCommand())
+                        {
+                            Icon = new IconInfo("\uE8E5"),
+                            Title = m.Stats,
+                            Subtitle = m.Tools != null ? $"Tools used: {m.Tools}" : "Tools used: none",
+                        });
+                    }
+                }
+
+                var body = m.Assistant + StatsFooter(m);
+                var item = new ListItem(new DetailedResponsePage(m.User, body))
                 {
                     Title = m.User,
                     Subtitle = m.Assistant,
@@ -574,29 +774,36 @@ internal sealed partial class LlmExtensionPage : DynamicListPage
                     item.Details = new Details()
                     {
                         Title = m.User,
-                        Body = m.Assistant,
+                        Body = body,
                     };
                 }
 
-                historyItems.Add(item);
+                items.Add(item);
             }
         }
 
-        if (!IsLoading)
+        if (!IsLoading && items.Count == 0)
         {
-            var multilinePage = new MultilineInputPage(text => _ = SendMessageAsync(text));
-            var composeItem = new ListItem(multilinePage) { Title = "Compose multiline message", Subtitle = "Open a form to type or paste multiline text" };
-            var setupItem = new ListItem(new GoToPageCommand(() => new SetupPage(_client)))
+            // Nothing to show yet — hint how to start instead of an empty list.
+            items.Add(new ListItem(new NoOpCommand())
             {
-                Title = "Set up LLM chat",
-                Subtitle = "Answer a few questions to connect a model (guided setup)",
-            };
-            _messagesMemo = sendItem.Concat(historyItems).Concat([composeItem, setupItem]).ToArray();
+                Title = "Type a message to chat",
+                Subtitle = "Press Enter to send — '/settings' to configure, '/models' to pick a model, '/help' for all commands",
+            });
         }
-        else
+
+        _messagesMemo = items.ToArray();
+    }
+
+    private static string StatsFooter(ChatMessage m)
+    {
+        if (m.Stats == null)
         {
-            _messagesMemo = historyItems.ToArray();
+            return string.Empty;
         }
+
+        var tools = m.Tools != null ? m.Tools : "none";
+        return $"\n\n---\n\n⏱ {m.Stats}\n\nTools used: {tools}";
     }
 
     internal static void ErrorToast(string message)
@@ -630,8 +837,8 @@ internal sealed record SlashCommand(
     Action<SendMessageCommand, object?, string>? Action = null,
     string? ActionToastText = null,
     Func<(string, string)>? Details = null,
-    string? Url = null,
-    Func<ContentPage>? Page = null
+    string? File = null,
+    Func<ICommand>? Page = null
 );
 
 internal sealed partial class SendMessageCommand : InvokableCommand
@@ -739,83 +946,31 @@ internal sealed partial class MarkdownPage : ContentPage
 }
 
 /// <summary>
-///     A ContentPage that hosts a multiline text input form.
-///     Navigated to when the user wants to paste or type a multiline message.
-///     On submit, fires the OnMessageSubmitted callback with the entered text.
+///     Opens a file in Notepad. Used by /config for direct access to
+///     config.json.
 /// </summary>
-internal sealed partial class MultilineInputPage : ContentPage
+internal sealed partial class OpenFileCommand : InvokableCommand
 {
-    private readonly MultilineInputForm _form;
+    private readonly string _filePath;
 
-    public MultilineInputPage(Action<string> onMessageSubmitted)
+    public OpenFileCommand(string filePath, string? name = null)
     {
-        Title = "Compose Message";
-        Name = "Compose multiline message";
-        Icon = new IconInfo("\uE932"); // Segoe UI "Edit" glyph
-
-        _form = new MultilineInputForm(onMessageSubmitted);
+        _filePath = filePath;
+        Name = name ?? "Open file";
     }
 
-    public override IContent[] GetContent()
+    public override ICommandResult Invoke()
     {
-        return [_form];
-    }
-}
-
-/// <summary>
-///     A FormContent using an Adaptive Card with isMultiline=true on the text input.
-/// </summary>
-internal sealed partial class MultilineInputForm : FormContent
-{
-    private readonly Action<string> _onMessageSubmitted;
-
-    public MultilineInputForm(Action<string> onMessageSubmitted)
-    {
-        _onMessageSubmitted = onMessageSubmitted;
-
-        // Adaptive Card JSON with "isMultiline": true renders a multiline textarea.
-        TemplateJson = """
+        try
         {
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "type": "AdaptiveCard",
-            "version": "1.6",
-            "body": [
-                {
-                    "type": "Input.Text",
-                    "id": "message",
-                    "label": "Message",
-                    "placeholder": "Type or paste your multiline message here...",
-                    "isMultiline": true,
-                    "isRequired": true,
-                    "errorMessage": "Message cannot be empty"
-                }
-            ],
-            "actions": [
-                {
-                    "type": "Action.Submit",
-                    "title": "Send"
-                }
-            ]
+            Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_filePath}\"") { UseShellExecute = true });
         }
-        """;
-    }
-
-    public override CommandResult SubmitForm(string payload)
-    {
-        var formInput = JsonNode.Parse(payload)?.AsObject();
-        if (formInput == null)
+        catch (Exception ex)
         {
-            return CommandResult.GoBack();
-        }
-
-        var message = formInput["message"]?.ToString();
-        if (string.IsNullOrWhiteSpace(message))
-        {
+            LlmExtensionPage.ErrorToast($"Could not open '{_filePath}': {ex.Message}");
             return CommandResult.KeepOpen();
         }
 
-        _onMessageSubmitted(message);
-
-        return CommandResult.GoBack();
+        return CommandResult.Dismiss();
     }
 }

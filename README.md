@@ -17,9 +17,14 @@ It currently supports the following APIs:
 
 Features:
 
-- **Guided setup wizard** — the extension asks you questions (service, server URL, model, API key) and you simply paste in the answers. No complicated `/` commands needed to get started.
-- **Web search with Exa** (optional) — let the LLM answer using fresh results from the web.
-- Streaming responses, Markdown rendering and conversation history.
+- **One simple settings form** — type `/settings`, pick your service and paste in the connection details. No wizard, no `/` commands needed to get started.
+- **Live model picker** — type `/models` to fetch the list of models straight from your provider and pick one.
+- **Streaming responses** — answers stream in live, with a status line showing the live **tok/s** while generating, plus tokens, duration and **which tools** (such as web search) were used per answer.
+- **Web search with Exa** (optional) — let the LLM answer using fresh results from the web. Works **without an API key** (free keyless search, rate-limited); paste a key from the [Exa dashboard](https://dashboard.exa.ai/) for the full API.
+- **Clear error messages** — rejected API keys, wrong model names, unreachable servers and rate limits each get their own actionable hint.
+- **Direct access to `config.json`** — type `/config` to open the raw configuration file in Notepad.
+- **ChatGPT hand-off** — messages longer than 200 characters (or with multiple lines) open in ChatGPT in your browser instead of the configured model.
+- Markdown rendering and conversation history.
 
 ## Requirements
 
@@ -47,21 +52,21 @@ msbuild LlmExtension\LlmExtension.csproj /restore /p:Configuration=Release /p:Pl
 
 ## Setup
 
-Open Command Palette → **LLM Chat** → **Set up LLM chat** (or type `/setup`). The wizard asks you three questions:
+Open Command Palette → **LLM Chat** → type `/settings`. The form shows all settings at once, prefilled with your current configuration:
 
-1. **Which service** do you want to use?
-2. **Connection details** — paste in your server URL, model name and API key. The wizard shows hints for each service, like the default Ollama URL (`http://localhost:11434/`).
-3. **Web search** (optional) — enable Exa web search and paste your Exa API key.
+- **Service** — Ollama, OpenAI (or any OpenAI-compatible API, such as Docker Model Runner), Azure OpenAI, Google Gemini, Groq or Mistral.
+- **Model** — the model to use (for Azure OpenAI, the name of your deployment). Or run `/models` in the chat to pick one from the live list at your provider.
+- **Server URL** — required for Ollama (default `http://localhost:11434/`) and Azure OpenAI; optional for the rest.
+- **API key** — not needed for Ollama; for the other services, paste the key from the provider's website.
+- **Web search** — toggle to let the LLM use [Exa](https://exa.ai/) web search. An Exa API key is optional: without one, free keyless search is used (rate-limited).
 
-That's it — you can start chatting. Advanced users can still tweak everything with `/` commands (type `/help` for the full list).
+Press **Save settings** and you're done. If your configuration is incomplete, a warning item appears on the main page of the extension — press Enter on it to open the same form.
 
-### Web search (optional)
+To change settings later, use `/settings` again, or open `config.json` directly with `/config`. Advanced users can also tweak individual settings with `/` commands (type `/help` in the extension for the full list).
 
-When web search is enabled, your message is first sent to the [Exa](https://exa.ai/) search API and the results are given to the LLM together with your question, so answers can use fresh information from the web.
+### Long messages
 
-1. Create an API key at the [Exa dashboard](https://dashboard.exa.ai/).
-2. Enable web search in the last setup step, or with `/websearch`.
-3. Paste the key when asked, or with `/exakey <your-key>`.
+The palette's input is a single line, so messages longer than 200 characters (or containing line breaks) are handed off to ChatGPT: the extension opens `chatgpt.com` in your default browser with your message as the query, ready to send.
 
 ## Development
 
